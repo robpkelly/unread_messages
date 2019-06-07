@@ -1,0 +1,171 @@
+#! /usr/bin/env python3
+"""Query the Thunderbird message database for unread messages"""
+
+import argparse
+import warnings
+from pathlib import Path
+from configparser import ConfigParser
+from datetime import datetime
+from functools import wraps
+import re
+import sqlite3
+
+fmt_re = re.compile('(?P<key>\w+)(?:\((?P<arg>\d*)\))?')  # noqa: W605
+
+
+def truncate(to=None):
+    def decorator(fn):
+        @wraps(fn)
+        def inner(*args, limit=to, **kwargs):
+            ret = fn(*args, **kwargs)
+            if limit is not None:
+                if len(ret) > limit:
+                    ret = ret[:limit-1] + '…'
+                ret = f"{ret:>{limit}}".format(ret=ret)
+            return ret
+        return inner
+    return decorator
+
+
+class RowFormatter:
+    def __init__(self, row, args):
+        self._row = row
+        self._date_format = args.date_format
+
+    @truncate(to=30)
+    def datetime(self):
+        dt = datetime.utcfromtimestamp(self._row['date'] / 1000000)
+        if self._date_format is not None:
+            return dt.strftime(self._date_format)
+        else:
+            return dt.isoformat()
+
+    @truncate()
+    def id(self):
+        return self._row['id']
+
+    @truncate(to=60)
+    def body(self):
+        return self._row['c0body']
+
+    @truncate(to=30)
+    def subject(self):
+        return self._row['c1subject']
+
+    @truncate(to=60)
+    def attachments(self):
+        return self._row['c2attachmentNames'].replace('\n', '; ')
+
+    @truncate(to=40)
+    def author(self):
+        return self._row['c3author']
+
+    @truncate(to=60)
+    def recipients(self):
+        return self._row['c4recipients'].replace('\n', '; ')
+
+    @truncate()
+    def notability(self):
+        return self._row['notability']
+
+    def __format__(self, format):
+        result = fmt_re.match(format)
+        key, arg = result['key'], result['arg']
+        if key is not None and hasattr(self, key):
+            method = getattr(self, key)
+            try:
+                arg = int(arg)
+                ret = method(limit=arg)
+            except Exception:
+                ret = method()
+            return ret
+
+        else:
+            return '?'
+
+
+_DEFAULT_ROW_FORMAT = "{:datetime(20)}  {:author}  {:subject}"
+_ROW_FORMAT_KEYS = [k for k in dir(RowFormatter) if not k.startswith('_')]
+
+# get default DB file
+_default_db_path = None
+_profiles_ini_path = Path.home() / ".thunderbird" / "profiles.ini"
+if _profiles_ini_path.exists():
+    profiles_ini = ConfigParser()
+    profiles_ini.read(str(_profiles_ini_path))
+    for profile in profiles_ini.values():
+        if 'default' in profile and profile['default'] == '1':
+            _default_db_path = (Path.home() /
+                                ".thunderbird" /
+                                profile['path'] /
+                                "global-messages-db.sqlite")
+
+# Warn user if default db can't be found
+if _default_db_path is None:
+    warnings.warn("Could not get default Thunderbird profile! "
+                  "Database must be explicitly specified with the --db flag.")
+
+# parse arguments
+parser = argparse.ArgumentParser(
+    description=__doc__,
+    formatter_class=lambda prog: argparse.ArgumentDefaultsHelpFormatter(
+        prog,
+        indent_increment=2,
+        width=120
+    )
+)
+parser.add_argument('--db', type=str, help="database file",
+                    default=_default_db_path)
+
+parser.add_argument('-f', '--format', type=str, default=_DEFAULT_ROW_FORMAT,
+                    help=f"""
+                    row format, where each formatting key is a method call with
+                    a row formatter object `r' which takes as argument a
+                    maximum field length to truncate to. Valid keys:
+                    {str(_ROW_FORMAT_KEYS)}
+                    """)
+parser.add_argument('-d', '--date-format', type=str, default=None,
+                    help="date format, passed to `datetime.strftime'")
+parser.add_argument('-t', '--truncate-to', type=int, default=60,
+                    help="number of characters to truncate long fields to")
+parser.add_argument('-c', '--count', action='store_true',
+                    help="include summary count of unread messages")
+parser.add_argument('-n', '--report-none', action='store_true',
+                    help="report if there are no unread messages")
+args = parser.parse_args()
+
+if args.report_none and args.count:
+    warnings.warn("Summary count option makes report-none option redundant")
+    args.report_none = False
+
+# open DB connection
+db = sqlite3.connect(
+    args.db,
+    detect_types=sqlite3.PARSE_DECLTYPES
+)
+db.row_factory = sqlite3.Row
+
+# query DB
+unread = db.execute("""
+SELECT * FROM messages
+INNER JOIN messagesText_content ON messages.id = messagesText_content.docid
+WHERE messages.jsonAttributes LIKE '%"59":false%'
+""").fetchall()
+
+# close DB connection
+db.close()
+
+# print unread messages
+if len(unread) == 0 and args.report_none:
+    # optionally report if there are no unread messages
+    print("No unread messages")
+
+fmt_string = args.format
+for message in unread:
+    fmt = RowFormatter(message, args)
+    # wack hack:
+    print(fmt_string.format(*tuple([fmt]*100)))
+
+if args.count:
+    # show summary
+    print(f"{len(unread)} unread messages")
